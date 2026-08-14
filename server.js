@@ -22,7 +22,6 @@ let UAParser = null;
 try {
     UAParser = require('ua-parser-js');
 } catch (e) {
-    // UA-Parser optional - fallback to basic parsing
     UAParser = function(ua) {
         return {
             getResult: () => ({
@@ -40,15 +39,10 @@ try {
 let TelegramBot = null;
 try {
     TelegramBot = require('node-telegram-bot-api');
-} catch (e) {
-    // Telegram bot optional
-}
+} catch (e) {}
 
 const app = express();
 app.set('trust proxy', false);
-process.on('unhandledRejection', (err) => {
-    logger.error({ error: err && err.message ? err.message : String(err), stack: err && err.stack ? err.stack : undefined }, 'unhandled_rejection');
-});
 
 // ====================== CONFIGURATION ======================
 const PORT = process.env.PORT || 10000;
@@ -78,7 +72,7 @@ const SOLVED_SESSION_TTL = 300000;
 const MAX_EXPIRY_SECONDS = 315360000;
 const ENABLE_FINGERPRINTING = process.env.ENABLE_FINGERPRINTING !== 'false';
 const FINGERPRINT_SALT = process.env.FINGERPRINT_SALT || crypto.randomBytes(16).toString('hex');
-const FINGERPRINT_RATE_LIMIT = 30; // per minute
+const FINGERPRINT_RATE_LIMIT = 30;
 const MAX_FP_FIELD = 256;
 const RETENTION_DAYS = Number(process.env.RETENTION_DAYS || 30);
 const MAX_FINGERPRINT_ROWS = Number(process.env.MAX_FINGERPRINT_ROWS || 200000);
@@ -206,6 +200,10 @@ const logger = logToConsole
     }))
     : pino({ level: 'info' }, pino.destination(join(process.cwd(), logFile)));
 
+process.on('unhandledRejection', (err) => {
+    logger.error({ error: err && err.message ? err.message : String(err), stack: err && err.stack ? err.stack : undefined }, 'unhandled_rejection');
+});
+
 // ====================== SQLITE DATABASE ======================
 function parseExpirySeconds(value) {
     if (value === undefined || value === null || value === '') return null;
@@ -218,114 +216,176 @@ class RedirectDatabase {
     constructor(dbPath) {
         this.dbPath = dbPath;
         this.db = null;
+        this.initialized = false;
+        this.initPromise = null;
         this.init();
     }
 
     init() {
-        this.db = new sqlite3.Database(this.dbPath, { timeout: 5000 });
+        if (this.initPromise) return this.initPromise;
         
-        // Enable WAL mode for better concurrency
-        this.db.run('PRAGMA journal_mode=WAL');
-        this.db.run('PRAGMA synchronous=NORMAL');
+        this.initPromise = new Promise((resolve, reject) => {
+            try {
+                this.db = new sqlite3.Database(this.dbPath, { timeout: 5000 });
+                
+                // Enable WAL mode for better concurrency
+                this.db.run('PRAGMA journal_mode=WAL');
+                this.db.run('PRAGMA synchronous=NORMAL');
+                
+                // Use serialize to ensure all tables are created in order
+                this.db.serialize(() => {
+                    // Create redirects table
+                    this.db.run(`
+                        CREATE TABLE IF NOT EXISTS redirects (
+                            code TEXT PRIMARY KEY,
+                            target_url TEXT NOT NULL,
+                            created_at TEXT NOT NULL,
+                            clicks INTEGER DEFAULT 0,
+                            unique_visitors INTEGER DEFAULT 0,
+                            last_clicked TEXT,
+                            expires_at TEXT,
+                            campaign_id TEXT
+                        )
+                    `, (err) => {
+                        if (err) console.error('Error creating redirects table:', err.message);
+                    });
+
+                    // Create bot_blocks table
+                    this.db.run(`
+                        CREATE TABLE IF NOT EXISTS bot_blocks (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            ip TEXT,
+                            user_agent TEXT,
+                            bot_score REAL,
+                            bot_confidence REAL,
+                            bot_verdict TEXT,
+                            bot_signals TEXT,
+                            code TEXT,
+                            timestamp TEXT
+                        )
+                    `, (err) => {
+                        if (err) console.error('Error creating bot_blocks table:', err.message);
+                    });
+
+                    // Create visitors table
+                    this.db.run(`
+                        CREATE TABLE IF NOT EXISTS visitors (
+                            code TEXT,
+                            visitor_id TEXT,
+                            first_seen TEXT,
+                            last_seen TEXT,
+                            PRIMARY KEY (code, visitor_id)
+                        )
+                    `, (err) => {
+                        if (err) console.error('Error creating visitors table:', err.message);
+                    });
+
+                    // Create device_fingerprints table
+                    this.db.run(`
+                        CREATE TABLE IF NOT EXISTS device_fingerprints (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            fingerprint_id TEXT UNIQUE,
+                            code TEXT,
+                            ip TEXT,
+                            user_agent TEXT,
+                            device_type TEXT,
+                            device_brand TEXT,
+                            device_model TEXT,
+                            os_name TEXT,
+                            os_version TEXT,
+                            browser_name TEXT,
+                            browser_version TEXT,
+                            screen_resolution TEXT,
+                            color_depth INTEGER,
+                            timezone TEXT,
+                            language TEXT,
+                            platform TEXT,
+                            hardware_concurrency INTEGER,
+                            device_memory REAL,
+                            webgl_vendor TEXT,
+                            webgl_renderer TEXT,
+                            audio_fingerprint TEXT,
+                            canvas_fingerprint TEXT,
+                            fonts_fingerprint TEXT,
+                            is_bot BOOLEAN DEFAULT 0,
+                            bot_confidence REAL,
+                            first_seen TEXT,
+                            last_seen TEXT,
+                            visit_count INTEGER DEFAULT 1
+                        )
+                    `, (err) => {
+                        if (err) console.error('Error creating device_fingerprints table:', err.message);
+                    });
+
+                    // Create click_events table
+                    this.db.run(`
+                        CREATE TABLE IF NOT EXISTS click_events (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            code TEXT,
+                            fingerprint_id TEXT,
+                            ip TEXT,
+                            country TEXT,
+                            user_agent TEXT,
+                            referrer TEXT,
+                            timestamp TEXT,
+                            bot_score REAL,
+                            bot_verdict TEXT,
+                            device_type TEXT,
+                            os_name TEXT,
+                            browser_name TEXT
+                        )
+                    `, (err) => {
+                        if (err) console.error('Error creating click_events table:', err.message);
+                    });
+
+                    // Create indexes
+                    this.db.run(`CREATE INDEX IF NOT EXISTS idx_bot_blocks_timestamp ON bot_blocks(timestamp DESC)`);
+                    this.db.run(`CREATE INDEX IF NOT EXISTS idx_redirects_expires_at ON redirects(expires_at)`);
+                    this.db.run(`CREATE INDEX IF NOT EXISTS idx_fingerprint_id ON device_fingerprints(fingerprint_id)`);
+                    this.db.run(`CREATE INDEX IF NOT EXISTS idx_click_events_code ON click_events(code)`);
+                    this.db.run(`CREATE INDEX IF NOT EXISTS idx_click_events_timestamp ON click_events(timestamp)`);
+                    this.db.run(`CREATE INDEX IF NOT EXISTS idx_device_fingerprints_last_seen ON device_fingerprints(last_seen)`);
+                });
+
+                // Verify tables exist
+                this.verifyTables();
+                this.initialized = true;
+                resolve();
+            } catch (error) {
+                console.error('Database initialization error:', error.message);
+                reject(error);
+            }
+        });
         
-        this.db.run(`
-            CREATE TABLE IF NOT EXISTS redirects (
-                code TEXT PRIMARY KEY,
-                target_url TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                clicks INTEGER DEFAULT 0,
-                unique_visitors INTEGER DEFAULT 0,
-                last_clicked TEXT,
-                expires_at TEXT,
-                campaign_id TEXT
-            )
-        `);
+        return this.initPromise;
+    }
 
-        this.db.run(`
-            CREATE TABLE IF NOT EXISTS bot_blocks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ip TEXT,
-                user_agent TEXT,
-                bot_score REAL,
-                bot_confidence REAL,
-                bot_verdict TEXT,
-                bot_signals TEXT,
-                code TEXT,
-                timestamp TEXT
-            )
-        `);
+    verifyTables() {
+        const requiredTables = ['redirects', 'bot_blocks', 'visitors', 'device_fingerprints', 'click_events'];
+        
+        for (const table of requiredTables) {
+            this.db.get(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`, [table], (err, row) => {
+                if (err) {
+                    console.error(`Error verifying table ${table}:`, err.message);
+                } else if (!row) {
+                    console.error(`Table ${table} does not exist!`);
+                    // Try to create it again
+                    this.db.run(`CREATE TABLE IF NOT EXISTS ${table} (id INTEGER PRIMARY KEY AUTOINCREMENT)`, (err) => {
+                        if (err) console.error(`Failed to create ${table}:`, err.message);
+                    });
+                }
+            });
+        }
+    }
 
-        this.db.run(`
-            CREATE TABLE IF NOT EXISTS visitors (
-                code TEXT,
-                visitor_id TEXT,
-                first_seen TEXT,
-                last_seen TEXT,
-                PRIMARY KEY (code, visitor_id)
-            )
-        `);
-
-        this.db.run(`
-            CREATE TABLE IF NOT EXISTS device_fingerprints (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                fingerprint_id TEXT UNIQUE,
-                code TEXT,
-                ip TEXT,
-                user_agent TEXT,
-                device_type TEXT,
-                device_brand TEXT,
-                device_model TEXT,
-                os_name TEXT,
-                os_version TEXT,
-                browser_name TEXT,
-                browser_version TEXT,
-                screen_resolution TEXT,
-                color_depth INTEGER,
-                timezone TEXT,
-                language TEXT,
-                platform TEXT,
-                hardware_concurrency INTEGER,
-                device_memory REAL,
-                webgl_vendor TEXT,
-                webgl_renderer TEXT,
-                audio_fingerprint TEXT,
-                canvas_fingerprint TEXT,
-                fonts_fingerprint TEXT,
-                is_bot BOOLEAN DEFAULT 0,
-                bot_confidence REAL,
-                first_seen TEXT,
-                last_seen TEXT,
-                visit_count INTEGER DEFAULT 1
-            )
-        `);
-
-        this.db.run(`
-            CREATE TABLE IF NOT EXISTS click_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                code TEXT,
-                fingerprint_id TEXT,
-                ip TEXT,
-                country TEXT,
-                user_agent TEXT,
-                referrer TEXT,
-                timestamp TEXT,
-                bot_score REAL,
-                bot_verdict TEXT,
-                device_type TEXT,
-                os_name TEXT,
-                browser_name TEXT
-            )
-        `);
-
-        this.db.run(`CREATE INDEX IF NOT EXISTS idx_bot_blocks_timestamp ON bot_blocks(timestamp DESC)`);
-        this.db.run(`CREATE INDEX IF NOT EXISTS idx_redirects_expires_at ON redirects(expires_at)`);
-        this.db.run(`CREATE INDEX IF NOT EXISTS idx_fingerprint_id ON device_fingerprints(fingerprint_id)`);
-        this.db.run(`CREATE INDEX IF NOT EXISTS idx_click_events_code ON click_events(code)`);
-        this.db.run(`CREATE INDEX IF NOT EXISTS idx_click_events_timestamp ON click_events(timestamp)`);
-        this.db.run(`CREATE INDEX IF NOT EXISTS idx_device_fingerprints_last_seen ON device_fingerprints(last_seen)`);
+    async ensureInitialized() {
+        if (!this.initialized) {
+            await this.initPromise;
+        }
     }
 
     async getRedirect(code) {
+        await this.ensureInitialized();
         return new Promise((resolve, reject) => {
             this.db.get(
                 'SELECT * FROM redirects WHERE code = ?',
@@ -339,6 +399,7 @@ class RedirectDatabase {
     }
 
     async getRedirectsExpired(now) {
+        await this.ensureInitialized();
         return new Promise((resolve, reject) => {
             this.db.all(
                 'SELECT code FROM redirects WHERE expires_at IS NOT NULL AND expires_at < ?',
@@ -352,6 +413,7 @@ class RedirectDatabase {
     }
 
     async saveRedirect(code, targetUrl, expiresAt = null, campaignId = '') {
+        await this.ensureInitialized();
         return new Promise((resolve, reject) => {
             this.db.run(
                 `INSERT OR REPLACE INTO redirects 
@@ -367,6 +429,7 @@ class RedirectDatabase {
     }
 
     async incrementClicks(code) {
+        await this.ensureInitialized();
         return new Promise((resolve, reject) => {
             this.db.run(
                 `UPDATE redirects 
@@ -382,6 +445,7 @@ class RedirectDatabase {
     }
 
     async addVisitor(code, visitorId) {
+        await this.ensureInitialized();
         return new Promise((resolve, reject) => {
             this.db.run(
                 `INSERT OR IGNORE INTO visitors (code, visitor_id, first_seen, last_seen) 
@@ -414,6 +478,7 @@ class RedirectDatabase {
     }
 
     async hasVisitor(code, visitorId) {
+        await this.ensureInitialized();
         return new Promise((resolve, reject) => {
             this.db.get(
                 'SELECT 1 FROM visitors WHERE code = ? AND visitor_id = ?',
@@ -427,6 +492,7 @@ class RedirectDatabase {
     }
 
     async logBotBlock(ip, userAgent, sig, code = null) {
+        await this.ensureInitialized();
         return new Promise((resolve, reject) => {
             this.db.run(
                 `INSERT INTO bot_blocks 
@@ -436,6 +502,7 @@ class RedirectDatabase {
                  JSON.stringify(sig.signals), code, new Date().toISOString()],
                 async (err) => {
                     if (err) {
+                        console.error('Error logging bot block:', err.message);
                         reject(err);
                         return;
                     }
@@ -443,6 +510,7 @@ class RedirectDatabase {
                         await this.pruneBotBlocks();
                         resolve();
                     } catch (e) {
+                        console.error('Error pruning bot blocks:', e.message);
                         reject(e);
                     }
                 }
@@ -451,6 +519,7 @@ class RedirectDatabase {
     }
 
     async pruneBotBlocks(limit = MAX_BOT_BLOCK_ROWS) {
+        await this.ensureInitialized();
         return new Promise((resolve, reject) => {
             this.db.run(
                 `DELETE FROM bot_blocks
@@ -466,6 +535,7 @@ class RedirectDatabase {
     }
 
     async getRecentBotBlocks(limit = 10) {
+        await this.ensureInitialized();
         return new Promise((resolve, reject) => {
             this.db.all(
                 `SELECT code, bot_verdict as verdict, bot_score as score, 
@@ -483,6 +553,7 @@ class RedirectDatabase {
     }
 
     async getAllLinks(limit = 20) {
+        await this.ensureInitialized();
         return new Promise((resolve, reject) => {
             this.db.all(
                 'SELECT code, target_url, clicks, created_at FROM redirects ORDER BY created_at DESC LIMIT ?',
@@ -496,6 +567,7 @@ class RedirectDatabase {
     }
 
     async deleteLink(code) {
+        await this.ensureInitialized();
         return new Promise((resolve, reject) => {
             this.db.run('DELETE FROM redirects WHERE code = ?', [code], (err) => {
                 if (err) reject(err);
@@ -510,6 +582,7 @@ class RedirectDatabase {
     }
 
     async getStats() {
+        await this.ensureInitialized();
         return new Promise((resolve, reject) => {
             const queries = [
                 'SELECT COUNT(*) AS count FROM redirects',
@@ -537,8 +610,8 @@ class RedirectDatabase {
         });
     }
 
-    // Fingerprint cleanup methods
     async pruneFingerprints(cutoff) {
+        await this.ensureInitialized();
         return new Promise((resolve, reject) => {
             this.db.run(
                 'DELETE FROM device_fingerprints WHERE last_seen < ?',
@@ -546,7 +619,6 @@ class RedirectDatabase {
                 (err) => {
                     if (err) reject(err);
                     else {
-                        // Hard cap
                         this.db.run(
                             `DELETE FROM device_fingerprints WHERE id NOT IN
                              (SELECT id FROM device_fingerprints ORDER BY last_seen DESC LIMIT ?)`,
@@ -563,6 +635,7 @@ class RedirectDatabase {
     }
 
     async pruneClickEvents(cutoff) {
+        await this.ensureInitialized();
         return new Promise((resolve, reject) => {
             this.db.run(
                 'DELETE FROM click_events WHERE timestamp < ?',
@@ -586,7 +659,6 @@ let persistedStore = { links: {}, visitors: {} };
 try {
     if (fs.existsSync(DB_JSON_PATH)) {
         persistedStore = JSON.parse(fs.readFileSync(DB_JSON_PATH, 'utf8')) || persistedStore;
-        // Validate existing JSON entries at startup
         setTimeout(() => validateJsonStoreEntries(), 1000);
     }
 } catch (e) {
@@ -600,7 +672,6 @@ function validateJsonStoreEntries() {
     for (const [code, data] of entries) {
         const url = data.originalUrl;
         if (url) {
-            // Remove invalid entries
             isAllowedTarget(url).then(allowed => {
                 if (!allowed) {
                     logger.warn({ code, url }, 'legacy_json_invalid_target_deleted');
@@ -703,7 +774,6 @@ setInterval(() => {
         }
     }
     
-    // Clean bot alert cooldowns (expiry-based)
     for (const [key, expiry] of botAlertCooldowns) {
         if (expiry <= now) {
             botAlertCooldowns.delete(key);
@@ -718,7 +788,6 @@ setInterval(() => {
         }
     }
 
-    // Clean fingerprint rate limits
     for (const [key, entry] of fingerprintRateLimit) {
         if (now - entry.windowStart > 60000) {
             fingerprintRateLimit.delete(key);
@@ -732,7 +801,6 @@ setInterval(() => {
         }
     }
 
-    // Data retention for fingerprints and click events
     const cutoff = new Date(Date.now() - RETENTION_DAYS * 24 * 3600 * 1000).toISOString();
     db.pruneFingerprints(cutoff).catch(err => {
         logger.error({ error: err.message }, 'fingerprint_retention_failed');
@@ -948,9 +1016,7 @@ function isTelegramChatAuthorized(chatId) {
 
 // ====================== BOUNDED MAP HELPERS ======================
 function rememberBotAlert(key) {
-    // Store expiry timestamp, not set-time
     botAlertCooldowns.set(key, Date.now() + BOT_ALERT_COOLDOWN_MS);
-    // Bound eviction
     if (botAlertCooldowns.size > MAX_BOT_ALERT_KEYS) {
         const toEvict = Math.ceil(MAX_BOT_ALERT_KEYS * 0.1);
         let i = 0;
@@ -1024,12 +1090,12 @@ class DeviceFingerprinter {
     }
 
     async saveFingerprint(fingerprintId, code, ip, userAgent, fingerprintData, sig) {
+        await dbInstance.ensureInitialized();
         const parsed = this.parseUserAgent(userAgent);
         const isBot = isBotVerdict(sig.verdict);
         const timestamp = new Date().toISOString();
 
         return new Promise((resolve, reject) => {
-            // Use ON CONFLICT for proper upsert
             this.db.run(
                 `INSERT INTO device_fingerprints 
                  (fingerprint_id, code, ip, user_agent, device_type, device_brand, device_model,
@@ -1083,7 +1149,6 @@ class DeviceFingerprinter {
                     isBot ? 1 : 0,
                     sig.confidence || 0,
                     timestamp,
-                    // ON UPDATE values:
                     timestamp,
                     ip,
                     userAgent,
@@ -1113,6 +1178,7 @@ class DeviceFingerprinter {
     }
 
     async logClickEvent(code, fingerprintId, ip, country, userAgent, referrer, sig) {
+        await dbInstance.ensureInitialized();
         const parsed = this.parseUserAgent(userAgent);
         
         return new Promise((resolve, reject) => {
@@ -1139,6 +1205,7 @@ class DeviceFingerprinter {
     }
 
     async getFingerprintStats(fingerprintId) {
+        await dbInstance.ensureInitialized();
         return new Promise((resolve, reject) => {
             this.db.get(
                 `SELECT * FROM device_fingerprints WHERE fingerprint_id = ?`,
@@ -1152,6 +1219,7 @@ class DeviceFingerprinter {
     }
 
     async getDeviceStats(code = null) {
+        await dbInstance.ensureInitialized();
         const whereClause = code ? 'WHERE code = ?' : '';
         const params = code ? [code] : [];
         const cutoff = new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString();
@@ -1186,6 +1254,7 @@ class DeviceFingerprinter {
     }
 
     async getClickEvents(code = null, limit = 100) {
+        await dbInstance.ensureInitialized();
         const clampedLimit = Math.min(Math.max(parseInt(limit, 10) || 100, 1), 1000);
         const whereClause = code ? 'WHERE code = ?' : '';
         const params = code ? [code, clampedLimit] : [clampedLimit];
@@ -1220,7 +1289,6 @@ class DeviceFingerprinter {
         return true;
     }
 
-    // Helper to get db instance
     get db() {
         return dbInstance.db;
     }
@@ -1742,7 +1810,6 @@ class ChallengeEngine {
         const safeNonce = escapeHtmlAttribute(nonce);
         
         const fingerprintScript = ENABLE_FINGERPRINTING ? `
-        // ====== FINGERPRINT COLLECTION ======
         async function collectFingerprint() {
             const fp = {};
             
@@ -1794,7 +1861,7 @@ class ChallengeEngine {
                 let audioCtx;
                 try {
                     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-                } catch(e) { /* AudioContext not supported */ }
+                } catch(e) { }
                 
                 if (audioCtx) {
                     if (audioCtx.state === 'running') {
@@ -1821,7 +1888,7 @@ class ChallengeEngine {
                             analyser.getByteFrequencyData(dataArray);
                             fp.audioFingerprint = Array.from(dataArray.slice(0, 50)).join(',');
                             oscillator.disconnect();
-                        } catch(e) { /* Could not resume */ }
+                        } catch(e) { }
                     }
                 }
             } catch(e) { fp.audioFingerprint = 'error'; }
@@ -2134,7 +2201,6 @@ class ChallengeEngine {
         const serverElapsed = Date.now() - challenge.startTime;
         
         if (!Number.isInteger(safeNonce) || safeNonce < 0) return false;
-        // Stricter timing validation using server-side time
         if (serverElapsed < 50 || serverElapsed > 120000) return false;
         if (!this.checkVerifyRateLimit(ip)) return false;
 
@@ -2149,7 +2215,6 @@ class ChallengeEngine {
         challenge.verified = true;
         challenge.verifiedAt = Date.now();
         challenge.ip = ip;
-        // Store client duration if provided (log-only)
         if (clientDuration !== null) {
             challenge.clientDuration = clientDuration;
         }
@@ -2346,7 +2411,6 @@ function requireAdminToken(req, res, next) {
 
 async function getCountryCode(req) {
     let ip = getClientIP(req);
-    // Use full isReservedIp check instead of partial list
     const normalized = ip.replace(/^\[|\]$/g, '').replace(/^::ffff:/, '');
     if (isReservedIp(normalized)) return 'LOCAL';
     
@@ -2403,17 +2467,14 @@ app.post('/api/fingerprint', async (req, res) => {
     const body = req.body || {};
     const { token, fingerprint } = body;
     
-    // Validate token - must be 32 character hex (challenge ID)
     if (!token || !/^[0-9a-f]{32}$/.test(String(token))) {
         return res.status(400).json({ error: 'Invalid token' });
     }
     
-    // Validate fingerprint data
     if (!fingerprint || typeof fingerprint !== 'object' || Array.isArray(fingerprint)) {
         return res.status(400).json({ error: 'fingerprint data required' });
     }
     
-    // Rate limit per IP
     const ip = req.clientIP;
     const now = Date.now();
     const rateKey = String(ip || 'unknown');
@@ -2428,7 +2489,6 @@ app.post('/api/fingerprint', async (req, res) => {
         fingerprintRateLimit.set(rateKey, { count: 1, windowStart: now });
     }
     
-    // Whitelist and cap fingerprint fields
     const allowedFields = [
         'screenResolution', 'colorDepth', 'pixelRatio', 'timezone', 'timezoneOffset',
         'language', 'languages', 'platform', 'hardwareConcurrency', 'deviceMemory',
@@ -2464,7 +2524,6 @@ app.post('/api/fingerprint', async (req, res) => {
             sig
         );
         
-        // Don't leak verdict back to client
         res.json({ 
             success: true, 
             fingerprintId
@@ -2534,6 +2593,17 @@ const analyzer = new BehavioralAnalyzer();
 const challengeEngine = new ChallengeEngine();
 const fingerprinter = new DeviceFingerprinter();
 
+// Wait for database to be ready
+(async () => {
+    try {
+        await dbInstance.ensureInitialized();
+        console.log('✅ Database initialized successfully');
+    } catch (err) {
+        console.error('❌ Database initialization failed:', err.message);
+        process.exit(1);
+    }
+})();
+
 // ====================== MIDDLEWARE ======================
 app.use((req, res, next) => {
     req.requestId = uuidv4();
@@ -2601,7 +2671,6 @@ app.post('/telegram/webhook', async (req, res) => {
         body = req.body || {};
         let updateId = body.update_id !== undefined ? String(body.update_id) : null;
         
-        // Duplicate/stale handling
         if (updateId) {
             if (recentUpdateIds.has(updateId)) {
                 return res.send('OK');
@@ -2621,7 +2690,6 @@ app.post('/telegram/webhook', async (req, res) => {
             return res.send('OK');
         }
         
-        // ====== CALLBACK QUERY BRANCH ======
         if (body.callback_query) {
             const query = body.callback_query;
             const data = query.data;
@@ -2686,25 +2754,21 @@ app.post('/telegram/webhook', async (req, res) => {
                 logger.error({ error: err.message }, 'telegram_callback_error');
                 await telegramBot.answerCallbackQuery(query.id).catch(() => {});
                 
-                // CRITICAL: Delete from recent update IDs and return 500 for retry
                 if (body && body.update_id !== undefined) {
                     recentUpdateIds.delete(String(body.update_id));
                 }
-                return res.status(500).send('Error'); // Do NOT advance update ID
+                return res.status(500).send('Error');
             }
             
-            // Only advance update ID on success
             if (updateId) {
                 lastTelegramUpdateId = parseInt(updateId);
             }
             return res.send('OK');
         }
         
-        // ====== MESSAGE BRANCH ======
         if (body.message && body.message.text) {
             const chatId = body.message.chat?.id;
             
-            // Guard against malformed updates
             if (!chatId) {
                 logger.warn({ body: JSON.stringify(body).slice(0, 200) }, 'telegram_message_missing_chat');
                 return res.send('OK');
@@ -2781,7 +2845,6 @@ Please use the web interface with admin authentication.
             } catch (err) {
                 logger.error({ error: err.message, command }, 'telegram_message_error');
                 
-                // Delete from recent update IDs and return 500 for retry
                 if (body && body.update_id !== undefined) {
                     recentUpdateIds.delete(String(body.update_id));
                 }
@@ -2870,7 +2933,6 @@ app.get('/telegram/commands', requireAdminToken, async (req, res) => {
 
 // ====================== ROUTES ======================
 
-// Health check
 app.get(['/ping', '/health', '/healthz'], (req, res) => {
     res.json({ 
         ok: true, 
@@ -2881,7 +2943,6 @@ app.get(['/ping', '/health', '/healthz'], (req, res) => {
     });
 });
 
-// Bot stats
 app.get('/api/bot-stats', requireAdminToken, async (req, res) => {
     const stats = await db.getStats();
     res.json({
@@ -2896,7 +2957,6 @@ app.get('/api/bot-stats', requireAdminToken, async (req, res) => {
     });
 });
 
-// Challenge verification - duration now optional
 app.post('/verify-challenge', async (req, res) => {
     const { challenge_id, nonce, duration } = req.body;
 
@@ -2919,7 +2979,6 @@ app.post('/verify-challenge', async (req, res) => {
     res.json({ ok: true, verified });
 });
 
-// Analytics
 app.get('/stats/:code', requireAdminToken, async (req, res) => {
     const code = req.params.code;
     
@@ -2950,7 +3009,6 @@ app.get('/stats/:code', requireAdminToken, async (req, res) => {
     });
 });
 
-// ====================== CREATE SHORT LINK ======================
 app.get('/shorten', asyncHandler(async (req, res) => {
     const { url, alias, expiresIn, campaign_id } = req.query;
     const ip = req.clientIP;
@@ -3154,7 +3212,6 @@ app.get('/:code', asyncHandler(async (req, res) => {
                 expires_at: jsonEntry.expiresAt ? new Date(jsonEntry.expiresAt).toISOString() : null
             };
             
-            // JSON entries are validated at startup, but keep this for safety
             if (!(await isAllowedTarget(entry.target_url))) {
                 logger.warn({ code, target: entry.target_url }, 'legacy_json_invalid_target');
                 return res.redirect(BOT_URLS[Math.floor(Math.random() * BOT_URLS.length)]);
@@ -3182,7 +3239,6 @@ app.get('/:code', asyncHandler(async (req, res) => {
         return res.status(410).send('Link has expired');
     }
 
-    // ====== HANDLE BOT VERDICTS ======
     if (sig.verdict === 'block') {
         await db.logBotBlock(ip, req.headers['user-agent'], sig, code);
         return res.status(403).send('Access denied');
@@ -3231,7 +3287,6 @@ app.get('/:code', asyncHandler(async (req, res) => {
         await new Promise(resolve => setTimeout(resolve, 250));
     }
 
-    // ====== COUNT CLICKS ======
     if (!isJsonFallback) {
         await db.incrementClicks(code);
         const visitorId = ip;
@@ -3252,7 +3307,6 @@ app.get('/:code', asyncHandler(async (req, res) => {
         }
     }
 
-    // ====== CACHE CHECK ======
     const cacheKey = `redirect:${code}`;
     const cachedTarget = responseCache.get(cacheKey);
     if (cachedTarget && sig.verdict !== 'slow_down') {
@@ -3262,7 +3316,6 @@ app.get('/:code', asyncHandler(async (req, res) => {
 
     responseCache.set(cacheKey, entry.target_url);
 
-    // ====== MILESTONE NOTIFICATION ======
     const newClickCount = (entry.clicks || 0) + 1;
     if (ENABLE_TELEGRAM && newClickCount % 100 === 0) {
         await sendTelegramMessage(`
